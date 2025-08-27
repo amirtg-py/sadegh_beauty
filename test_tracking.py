@@ -50,9 +50,9 @@ def experiment():
     for w, acc, seed_acc, count in results:
         print(f"{w}\t{acc:.3f}\t{seed_acc:.3f}\t{count}")
 
-    # Compare seeding methods on fixed window
+    # Compare seeding methods on fixed window, including automatic selection
     w = 50.0
-    for method in ["ransac", "kalman"]:
+    for method in ["ransac", "kalman", "auto"]:
         seeds = seed_initial_labels(T, A, num_classes=3, method=method)
         mask = T <= w
         mask &= (seeds >= 0)
