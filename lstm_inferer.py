@@ -131,9 +131,16 @@ def seed_labels_ransac(T: np.ndarray, A: np.ndarray, num_classes: int,
     for lab in range(num_classes):
         if len(remain) < min_samples:
             break
-        ransac = RANSACRegressor(base_estimator=LinearRegression(),
-                                 min_samples=min_samples,
-                                 residual_threshold=resid)
+        # scikit-learn >=1.1 uses 'estimator' instead of 'base_estimator'
+        # for older versions this argument is still named 'base_estimator'.
+        # Detect which one is available to keep compatibility.
+        ransac_kwargs = dict(min_samples=min_samples,
+                             residual_threshold=resid)
+        if 'estimator' in RANSACRegressor.__init__.__code__.co_varnames:
+            ransac_kwargs['estimator'] = LinearRegression()
+        else:  # pragma: no cover - older scikit-learn
+            ransac_kwargs['base_estimator'] = LinearRegression()
+        ransac = RANSACRegressor(**ransac_kwargs)
         ransac.fit(Tw[remain].reshape(-1,1), Aw[remain])
         inliers = remain[ransac.inlier_mask_]
         if len(inliers) < min_samples:
