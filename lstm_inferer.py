@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import confusion_matrix
 from scipy.optimize import linear_sum_assignment
 from sklearn.linear_model import RANSACRegressor, LinearRegression
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, DBSCAN
 
 try:  # Kalman filter is optional
     from filterpy.kalman import KalmanFilter
@@ -56,6 +56,13 @@ SEED_WINDOW = 50.0           # عرض پنجرهٔ اولیه (واحد زمان
 SEED_METHOD = "auto"         # 'ransac' | 'kalman' | 'auto'
 SEED_MIN_SAMPLES = 5         # حداقل نقاط برای هر مدل
 SEED_RANSAC_RESID = 1.0      # آستانهٔ خطای رانساک
+
+# --- density-based clustering + tracking parameters ---
+TRACK_ENABLE = True           # فعال‌سازی الگوریتم پنجره‌ای
+TRACK_CLUSTER_EPS = 1.0       # حساسیت خوشه‌بندی DBSCAN
+TRACK_CLUSTER_MIN = 3         # حداقل نمونه در خوشه ابتدایی
+TRACK_GAP_THRESH = 20.0       # آستانه گپ زمانی برای پایان مسیر
+TRACK_DIST_THRESH = 5.0       # آستانه فاصله زاویه‌ای برای نسبت دادن نقطه
 
 # ---------------- Utils ----------------
 def log(msg): print(msg, flush=True)
@@ -195,6 +202,82 @@ def seed_initial_labels(T: np.ndarray, A: np.ndarray, num_classes: int,
     if (k >= 0).sum() > (r >= 0).sum():
         return k
     return r
+
+
+# ---------------- Window clustering and tracking ----------------
+def cluster_initial_window(T: np.ndarray, A: np.ndarray,
+                           window: float=SEED_WINDOW,
+                           eps: float=TRACK_CLUSTER_EPS,
+                           min_samples: int=TRACK_CLUSTER_MIN) -> np.ndarray:
+    """Label dense groups in the first time window using DBSCAN."""
+    mask = T <= (T[0] + window)
+    out = np.full(len(T), -1, dtype=int)
+    coords = np.column_stack((T[mask], A[mask]))
+    if len(coords) == 0:
+        return out
+    db = DBSCAN(eps=eps, min_samples=min_samples)
+    labs = db.fit_predict(coords)
+    valid = labs >= 0
+    out[np.where(mask)[0][valid]] = labs[valid]
+    return out
+
+
+def track_from_window(T: np.ndarray, A: np.ndarray, logits: np.ndarray,
+                      seeds: np.ndarray,
+                      gap: float=TRACK_GAP_THRESH,
+                      dist_thr: float=TRACK_DIST_THRESH) -> np.ndarray:
+    """Propagate labels forward using constant-velocity prediction and model probs."""
+    labels = seeds.copy()
+    active = {}
+    for lab in np.unique(seeds):
+        if lab < 0:
+            continue
+        idxs = np.where(seeds == lab)[0]
+        last = idxs[-1]
+        if len(idxs) >= 2:
+            i1, i2 = idxs[-2], idxs[-1]
+            dt = T[i2] - T[i1]
+            dt = 1e-6 if dt == 0 else dt
+            vel = ang_diff(A[i2], A[i1]) / dt
+        else:
+            vel = 0.0
+        active[lab] = {"last": last, "vel": vel}
+    start = (np.where(seeds >= 0)[0].max() + 1) if np.any(seeds >= 0) else 0
+    for i in range(start, len(T)):
+        if labels[i] >= 0:
+            continue
+        best_lab = None
+        best_cost = None
+        for lab, st in list(active.items()):
+            dt = T[i] - T[st["last"]]
+            if dt > gap:
+                continue
+            pred = A[st["last"]] + st["vel"] * dt
+            dist = abs(ang_diff(A[i], pred))
+            prob = logits[i, lab] if lab < logits.shape[1] else 0.0
+            cost = dist - prob
+            if dist <= dist_thr and (best_cost is None or cost < best_cost):
+                best_cost = cost
+                best_lab = lab
+        if best_lab is not None:
+            prev = active[best_lab]["last"]
+            dt = T[i] - T[prev]
+            dt = 1e-6 if dt == 0 else dt
+            active[best_lab]["vel"] = ang_diff(A[i], A[prev]) / dt
+            active[best_lab]["last"] = i
+            labels[i] = best_lab
+    # fill remaining gaps by average model probability
+    unlabeled = np.where(labels == -1)[0]
+    start = 0
+    while start < len(unlabeled):
+        end = start
+        while end + 1 < len(unlabeled) and unlabeled[end + 1] == unlabeled[end] + 1:
+            end += 1
+        block = unlabeled[start:end + 1]
+        avg = logits[block].mean(axis=0)
+        labels[block] = int(np.argmax(avg))
+        start = end + 1
+    return labels
 
 # ---------------- Feature Engineering ----------------
 def engineer_features(df: pd.DataFrame):
@@ -431,6 +514,16 @@ def process_one(csv_path: str):
     if m.any():
         y_row[m] = seeds[m]
         y_pp[m] = seeds[m]
+
+    # 4) optional clustering + tracking to propagate labels
+    if TRACK_ENABLE:
+        seed_w = cluster_initial_window(T, A, window=SEED_WINDOW,
+                                        eps=TRACK_CLUSTER_EPS,
+                                        min_samples=TRACK_CLUSTER_MIN)
+        comb = np.where(seed_w >= 0, seed_w, seeds)
+        y_pp = track_from_window(T, A, logits_row, comb,
+                                 gap=TRACK_GAP_THRESH,
+                                 dist_thr=TRACK_DIST_THRESH)
 
     base  = Path(csv_path).stem
     out_csv = Path(OUT_DIR, "real", f"{base}_{model_tag}_inference.csv")
