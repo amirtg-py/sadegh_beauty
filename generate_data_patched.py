@@ -4,6 +4,20 @@ import random
 import os
 import matplotlib.pyplot as plt
 
+# ---------- پروفایل گام‌های زمانی بر اساس تحلیل دادهٔ واقعی ----------
+TIME_DIFF_PROFILE = {
+    'link': {
+        'probs': [0.1629, 0.4172, 0.3846, 0.0319, 0.0034],
+        # بازه‌ها: صفر، بسیار سریع، عادی، فاصلهٔ کوتاه، فاصلهٔ بزرگ
+        'ranges': [(0.0, 0.0), (0.0, 0.1), (0.1, 1.0), (1.0, 5.0), (5.0, 20.0)]
+    },
+    'mode': {
+        'probs': [0.6011, 0.0366, 0.1648, 0.1656, 0.0319],
+        'ranges': [(0.0, 0.0), (0.0, 0.1), (0.1, 1.0), (1.0, 5.0), (5.0, 20.0)]
+    }
+}
+
+
 # ---------- پارامترهای ورودی ----------
 num_files = int(input('Enter number of files to generate: '))
 rows_per_file = int(input('Enter approximate number of rows per file: '))
@@ -15,8 +29,23 @@ os.makedirs(output_dir, exist_ok=True)
 os.makedirs(plot_dir, exist_ok=True)
 
 # ---------- توابع تولید دیتا ----------
-def generate_object_points(num_points, behavior, mean_step, start_time, mean_az, sd_az, min_az, max_az, label):
-    steps = np.random.exponential(mean_step, num_points - 1)
+def sample_time_steps(num_points, profile):
+    """Generate time steps using a mixture distribution matching real data."""
+    probs = profile['probs']
+    ranges = profile['ranges']
+    cats = np.random.choice(len(probs), size=num_points - 1, p=probs)
+    steps = np.empty(num_points - 1)
+    for i, c in enumerate(cats):
+        low, high = ranges[c]
+        if low == high == 0.0:
+            steps[i] = 0.0
+        else:
+            steps[i] = np.random.uniform(low, high)
+    return steps
+
+
+def generate_object_points(num_points, behavior, mean_step, start_time, mean_az, sd_az, min_az, max_az, label, time_profile):
+    steps = sample_time_steps(num_points, time_profile)
     t = np.cumsum([start_time] + list(steps))
     offset = np.clip(np.random.normal(mean_az, sd_az), min_az, max_az)
 
@@ -237,7 +266,8 @@ for file_idx in range(num_files):
     for obj_id, behavior in enumerate(behaviors):
         points_per_object = rows_per_file // num_objects
         df_obj = generate_object_points(points_per_object, behavior, mean_step, start_time,
-                                        mean_az, sd_az, min_az, max_az, obj_id)
+                                        mean_az, sd_az, min_az, max_az, obj_id,
+                                        TIME_DIFF_PROFILE[dataset_type])
 
         df_obj = apply_density_variation(df_obj)
         if random.random() < 0.5:
