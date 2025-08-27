@@ -6,9 +6,9 @@ import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 
 # --- 1. تنظیمات اولیه: مسیر کامل پوشه‌ها ---
-# لطفاً مطمئن شوید این مسیرها دقیقاً با ساختار پوشه شما مطابقت دارند
-GENERATED_DATA_DIR = r'D:\work_station\radar\final\data_generated_final_fixed'
-REAL_DATA_DIR = r'D:\work_station\radar_co\radar\final\data2\project_files\lstm_out\real' # مسیر اصلاح شده
+# مسیرها به‌صورت نسبی تنظیم شده‌اند تا در هر محیطی قابل اجرا باشند
+GENERATED_DATA_DIR = os.path.join(os.getcwd(), 'generated_data')
+REAL_DATA_DIR = os.path.join(os.getcwd(), 'data real')
 
 # نتایج در پوشه‌ای به این نام در کنار اسکریپت ذخیره می‌شوند
 OUTPUT_DIR = 'analysis_results_final_v2'

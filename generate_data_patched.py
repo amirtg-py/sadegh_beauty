@@ -23,7 +23,8 @@ num_files = int(input('Enter number of files to generate: '))
 rows_per_file = int(input('Enter approximate number of rows per file: '))
 dataset_type = input('Enter dataset type (link or mode): ').lower()
 
-output_dir = 'd:\\work_station\\raise\\radar\\final\\data2'
+# خروجی به‌صورت پیش‌فرض در پوشه‌ای محلی ذخیره می‌شود تا وابسته به مسیر خاصی نباشد
+output_dir = os.path.join(os.getcwd(), 'generated_data')
 plot_dir = os.path.join(output_dir, "plots")
 os.makedirs(output_dir, exist_ok=True)
 os.makedirs(plot_dir, exist_ok=True)
@@ -76,6 +77,10 @@ def generate_object_points(num_points, behavior, mean_step, start_time, mean_az,
     return pd.DataFrame({'Time': t, 'Azimuth': azimuth, 'Label': label})
 
 def apply_density_variation(df):
+    """کاهش یا افزایش موضعی چگالی نقاط.
+
+    برای جلوگیری از تولید بیش از حد گام‌های زمانی بسیار کوچک، تنها عملیات کاهش تراکم
+    انجام می‌شود تا توزیع فاصله‌های زمانی به داده‌های واقعی نزدیک‌تر بماند."""
     total_time = df['Time'].max() - df['Time'].min()
     num_windows = random.randint(2, 5)
 
@@ -87,24 +92,10 @@ def apply_density_variation(df):
         if win_mask.sum() < 5:
             continue
 
-        if random.random() < 0.5:
-            # کاهش تراکم
-            reduction = random.uniform(0.1, 0.8)
-            mask = np.random.choice([True, False], win_mask.sum(), p=[1 - reduction, reduction])
-            df = df.drop(df[win_mask].index[~mask])
-        else:
-            # افزایش تراکم
-            win_df = df[win_mask].copy()
-            extra_points = []
-            for i in range(len(win_df) - 1):
-                p1, p2 = win_df.iloc[i], win_df.iloc[i + 1]
-                n_new = random.randint(1, 3)
-                for k in range(1, n_new + 1):
-                    frac = k / (n_new + 1)
-                    new_t = p1['Time'] + frac * (p2['Time'] - p1['Time']) + np.random.normal(0, 0.001)
-                    new_az = p1['Azimuth'] + frac * (p2['Azimuth'] - p1['Azimuth']) + np.random.normal(0, 0.05)
-                    extra_points.append([new_t, new_az, p1['Label']])
-            df = pd.concat([df, pd.DataFrame(extra_points, columns=['Time', 'Azimuth', 'Label'])])
+        # تنها کاهش تراکم در پنجره انتخابی اعمال می‌شود
+        reduction = random.uniform(0.1, 0.8)
+        mask = np.random.choice([True, False], win_mask.sum(), p=[1 - reduction, reduction])
+        df = df.drop(df[win_mask].index[~mask])
 
         df = df.sort_values('Time').reset_index(drop=True)
     return df.reset_index(drop=True)
@@ -129,13 +120,13 @@ REAL_CONF = {
     'link': {
         'median_dt': 0.123,                  # میانه Δt واقعی (واحد خام)
         'max_per_median_window': 19,         # بیشینه تراکم در پنجره با عرض میانه Δt
-        'pct_points_in_exact_same_time': 0.206715,  # ~20.6715%
+        'pct_points_in_exact_same_time': 0.1629,  # درصد نقاط با زمان تکراری در داده واقعی
         'max_exact_same_time': 19            # بیشینه نقاط دقیقاً در یک مقدار Time
     },
     'mode': {
         'median_dt': 0.88725,
         'max_per_median_window': 10,
-        'pct_points_in_exact_same_time': 0.0577012133,  # ~5.7701%
+        'pct_points_in_exact_same_time': 0.6011,  # درصد نقاط با زمان تکراری در داده واقعی
         'max_exact_same_time': 8
     }
 }
@@ -230,6 +221,54 @@ def inject_exact_same_time_percent(df, target_fraction, window_width, max_per_bi
 
     return df.sort_values('Time').reset_index(drop=True)
 
+def balance_time_step_distribution(df, profile, t_max):
+    """Adjust time differences so category frequencies stay close to target profile.
+
+    Categories that exceed their expected counts are shifted to the next
+    category range by increasing subsequent time stamps with small random
+    increments. This preserves randomness while preventing domination of
+    very small time steps.
+    """
+    if len(df) < 2:
+        return df
+
+    ranges = profile['ranges']
+    probs = profile['probs']
+    times = df['Time'].to_numpy(copy=True)
+    diffs = np.diff(times)
+    # map each diff to a category index
+    def cat_idx(x):
+        for idx, (low, high) in enumerate(ranges):
+            if low <= x <= high:
+                return idx
+        return len(ranges) - 1
+
+    cats = np.array([cat_idx(d) for d in diffs])
+    total = len(diffs)
+    desired = (np.array(probs) * total).astype(int)
+    counts = np.bincount(cats, minlength=len(probs))
+
+    for idx in range(len(probs) - 1):
+        excess = counts[idx] - desired[idx]
+        if excess <= 0:
+            continue
+        locs = np.where(cats == idx)[0]
+        if len(locs) == 0:
+            continue
+        move = np.random.choice(locs, size=excess, replace=False)
+        for i in move:
+            new_step = np.random.uniform(ranges[idx + 1][0], ranges[idx + 1][1])
+            delta = new_step - diffs[i]
+            times[i + 1 :] += delta
+            diffs[i] = new_step
+            cats[i] = idx + 1
+        counts[idx] -= excess
+        counts[idx + 1] += excess
+
+    df['Time'] = times
+    df = df[df['Time'] <= t_max].reset_index(drop=True)
+    return df
+
 # ---------- پارامترها بر اساس نوع دیتاست ----------
 if dataset_type == 'link':
     start_time = 58154.7921830403
@@ -299,6 +338,13 @@ for file_idx in range(num_files):
         max_per_bin=CONF['max_per_median_window'],
         max_exact_same_time=CONF['max_exact_same_time'],
         max_neighbors_shift=10
+    )
+
+    # === (3) تعدیل نهایی توزیع گام‌های زمانی برای نزدیک‌تر شدن به واقعیت ===
+    combined_df = balance_time_step_distribution(
+        combined_df,
+        TIME_DIFF_PROFILE[dataset_type],
+        t_max=end_time
     )
 
     # ذخیره CSV
