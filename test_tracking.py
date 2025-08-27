@@ -59,5 +59,24 @@ def experiment():
         acc = hungarian_acc(true_labels[mask], seeds[mask])[0] if mask.any() else 0.0
         print(f"seeding {method}: acc={acc:.3f}, labeled={mask.sum()}")
 
+def experiment_real():
+    import csv
+    T, A, labels = [], [], []
+    fn = "data real/generated_mode_1_ensemble_pred.csv"
+    with open(fn) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            T.append(float(row["Time"]))
+            A.append(float(row["Azimuth"]))
+            labels.append(int(float(row["Label"])))
+    T = np.array(T)
+    A = np.array(A)
+    labels = np.array(labels)
+    seeds = cluster_initial_window(T, A, window=50.0, eps=0.6, min_samples=5)
+    mask = (T <= T[0] + 50.0) & (seeds >= 0)
+    acc, _ = hungarian_acc(labels[mask], seeds[mask]) if mask.any() else (0.0, None)
+    print(f"real data: clusters={len(set(seeds[mask]))} acc={acc:.3f} labeled={mask.sum()}")
+
 if __name__ == "__main__":
     experiment()
+    experiment_real()

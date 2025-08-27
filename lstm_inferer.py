@@ -18,13 +18,22 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from sklearn.metrics import confusion_matrix
+try:
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader
+    TORCH_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dependency
+    torch = None
+    nn = None
+    DataLoader = None
+    TORCH_AVAILABLE = False
+
+from sklearn.metrics import confusion_matrix, silhouette_score
 from scipy.optimize import linear_sum_assignment
 from sklearn.linear_model import RANSACRegressor, LinearRegression
 from sklearn.cluster import KMeans, DBSCAN
+from sklearn.preprocessing import StandardScaler
 
 try:  # Kalman filter is optional
     from filterpy.kalman import KalmanFilter
@@ -43,7 +52,7 @@ TEST_FILES = glob.glob(os.path.join(TEST_DIR, "*.csv"))
 
 # ---------------- Inference Options ----------------
 SEQ_LEN = 64
-DEVICE  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE  = torch.device("cuda" if torch and torch.cuda.is_available() else "cpu") if TORCH_AVAILABLE else "cpu"
 
 USE_ENSEMBLE = True       # اگر هر دو مدل باشند، میانگین نرم‌احتمال
 PP_ALPHA = 1.0            # وزن فاصله زاویه‌ای در هزینه یگانگی
@@ -59,7 +68,7 @@ SEED_RANSAC_RESID = 1.0      # آستانهٔ خطای رانساک
 
 # --- density-based clustering + tracking parameters ---
 TRACK_ENABLE = True           # فعال‌سازی الگوریتم پنجره‌ای
-TRACK_CLUSTER_EPS = 1.0       # حساسیت خوشه‌بندی DBSCAN
+TRACK_CLUSTER_EPS = 0.6       # حساسیت خوشه‌بندی DBSCAN پس از نرمال‌سازی
 TRACK_CLUSTER_MIN = 3         # حداقل نمونه در خوشه ابتدایی
 TRACK_GAP_THRESH = 20.0       # آستانه گپ زمانی برای پایان مسیر
 TRACK_DIST_THRESH = 5.0       # آستانه فاصله زاویه‌ای برای نسبت دادن نقطه
@@ -215,8 +224,20 @@ def cluster_initial_window(T: np.ndarray, A: np.ndarray,
     coords = np.column_stack((T[mask], A[mask]))
     if len(coords) == 0:
         return out
+    coords = StandardScaler().fit_transform(coords)
     db = DBSCAN(eps=eps, min_samples=min_samples)
     labs = db.fit_predict(coords)
+    if len(set(labs[labs >= 0])) <= 1:
+        best_labs = None
+        best_score = -1.0
+        for k in range(2, min(15, len(coords))):
+            km_labs = KMeans(n_clusters=k, n_init=10).fit_predict(coords)
+            score = silhouette_score(coords, km_labs)
+            if score > best_score:
+                best_score = score
+                best_labs = km_labs
+        if best_labs is not None:
+            labs = best_labs
     valid = labs >= 0
     out[np.where(mask)[0][valid]] = labs[valid]
     return out
@@ -304,47 +325,50 @@ def build_sequences(X: np.ndarray, seq_len=SEQ_LEN):
     return X_seq, idx_map
 
 # ---------------- Models (same as training) ----------------
-class BiLSTMClassifier(nn.Module):
-    def __init__(self, input_dim=5, hidden=128, layers=2, num_classes=2, dropout=0.2):
-        super().__init__()
-        self.lstm = nn.LSTM(input_dim, hidden, num_layers=layers, batch_first=True, bidirectional=True, dropout=dropout)
-        self.fc1  = nn.Linear(hidden*2, hidden)
-        self.relu = nn.ReLU()
-        self.drop = nn.Dropout(dropout)
-        self.fc2  = nn.Linear(hidden, num_classes)
-    def forward(self, x):
-        y,_ = self.lstm(x)
-        h = y[:,-1,:]
-        z = self.drop(self.relu(self.fc1(h)))
-        return self.fc2(z)
+if TORCH_AVAILABLE:
+    class BiLSTMClassifier(nn.Module):
+        def __init__(self, input_dim=5, hidden=128, layers=2, num_classes=2, dropout=0.2):
+            super().__init__()
+            self.lstm = nn.LSTM(input_dim, hidden, num_layers=layers, batch_first=True, bidirectional=True, dropout=dropout)
+            self.fc1  = nn.Linear(hidden*2, hidden)
+            self.relu = nn.ReLU()
+            self.drop = nn.Dropout(dropout)
+            self.fc2  = nn.Linear(hidden, num_classes)
+        def forward(self, x):
+            y,_ = self.lstm(x)
+            h = y[:,-1,:]
+            z = self.drop(self.relu(self.fc1(h)))
+            return self.fc2(z)
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=2000):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0)/d_model))
-        pe[:,0::2] = torch.sin(pos*div); pe[:,1::2] = torch.cos(pos*div)
-        self.register_buffer('pe', pe.unsqueeze(0))
-    def forward(self, x):
-        return x + self.pe[:,:x.size(1),:]
+    class PositionalEncoding(nn.Module):
+        def __init__(self, d_model, max_len=2000):
+            super().__init__()
+            pe = torch.zeros(max_len, d_model)
+            pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+            div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0)/d_model))
+            pe[:,0::2] = torch.sin(pos*div); pe[:,1::2] = torch.cos(pos*div)
+            self.register_buffer('pe', pe.unsqueeze(0))
+        def forward(self, x):
+            return x + self.pe[:,:x.size(1),:]
 
-class TransEncClassifier(nn.Module):
-    def __init__(self, input_dim=5, d_model=64, nhead=4, num_layers=2,
-                 dim_ff=128, num_classes=2, dropout=0.2, pos_max_len=2000):
-        super().__init__()
-        self.inp = nn.Linear(input_dim, d_model)
-        enc_layer = nn.TransformerEncoderLayer(d_model, nhead, dim_ff, dropout, batch_first=True)
-        self.enc = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.pe  = PositionalEncoding(d_model, max_len=pos_max_len)
-        self.fc  = nn.Linear(d_model, num_classes)
+    class TransEncClassifier(nn.Module):
+        def __init__(self, input_dim=5, d_model=64, nhead=4, num_layers=2,
+                     dim_ff=128, num_classes=2, dropout=0.2, pos_max_len=2000):
+            super().__init__()
+            self.inp = nn.Linear(input_dim, d_model)
+            enc_layer = nn.TransformerEncoderLayer(d_model, nhead, dim_ff, dropout, batch_first=True)
+            self.enc = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+            self.pe  = PositionalEncoding(d_model, max_len=pos_max_len)
+            self.fc  = nn.Linear(d_model, num_classes)
 
-    def forward(self, x):
-        z = self.inp(x)
-        z = self.pe(z)
-        y = self.enc(z)
-        h = y[:, -1, :]
-        return self.fc(h)
+        def forward(self, x):
+            z = self.inp(x)
+            z = self.pe(z)
+            y = self.enc(z)
+            h = y[:, -1, :]
+            return self.fc(h)
+else:  # pragma: no cover
+    BiLSTMClassifier = PositionalEncoding = TransEncClassifier = None
 
 
 def detect_num_classes_from_state_dict(sd, head=("fc2.weight","fc.weight")):
@@ -400,17 +424,21 @@ def load_models(model_dir=MODEL_DIR):
     return lstm, trans, C
 
 
-@torch.no_grad()
-def infer_logits(model, X_seq, C):
-    loader = DataLoader(torch.tensor(X_seq), batch_size=256, shuffle=False)
-    logits_all = np.zeros((len(X_seq), C), np.float32)
-    off=0
-    for xb in loader:
-        xb = xb.to(DEVICE)
-        out = model(xb).softmax(1).cpu().numpy()
-        logits_all[off:off+len(out)] = out
-        off += len(out)
-    return logits_all
+if TORCH_AVAILABLE:
+    @torch.no_grad()
+    def infer_logits(model, X_seq, C):
+        loader = DataLoader(torch.tensor(X_seq), batch_size=256, shuffle=False)
+        logits_all = np.zeros((len(X_seq), C), np.float32)
+        off=0
+        for xb in loader:
+            xb = xb.to(DEVICE)
+            out = model(xb).softmax(1).cpu().numpy()
+            logits_all[off:off+len(out)] = out
+            off += len(out)
+        return logits_all
+else:  # pragma: no cover
+    def infer_logits(*args, **kwargs):
+        raise ImportError("PyTorch is required for infer_logits")
 
 # ---------------- Post-processing (improved uniqueness) ----------------
 def enforce_uniqueness_prob_aware(T, A, labels, logits, alpha=PP_ALPHA, beta=PP_BETA, conf_thr=PP_CONF_THRESH):
