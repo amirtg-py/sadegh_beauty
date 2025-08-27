@@ -23,6 +23,15 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from sklearn.metrics import confusion_matrix
 from scipy.optimize import linear_sum_assignment
+from sklearn.linear_model import RANSACRegressor, LinearRegression
+from sklearn.cluster import KMeans
+
+try:  # Kalman filter is optional
+    from filterpy.kalman import KalmanFilter
+    HAS_FILTERPY = True
+except Exception:  # pragma: no cover - optional dependency
+    KalmanFilter = None
+    HAS_FILTERPY = False
 
 # ---------------- FIXED PATHS ----------------
 MODEL_DIR = r"D:\work_station\radar_co\radar\final\sadegh_beauty-codex-improve-data-generation-script-accuracy\generated_datalstm out"
@@ -41,6 +50,12 @@ PP_ALPHA = 1.0            # وزن فاصله زاویه‌ای در هزینه 
 PP_BETA  = 2.0            # وزن -log(prob) در هزینه یگانگی
 PP_CONF_THRESH = 0.40     # حداقل اعتماد برای جابجایی (prob کلاس فعلی < این مقدار)
 SMOOTH_MIN_RUN = 6        # هموارسازی: حداقل طول سگمنت
+
+# --- initial label seeding on a small time window ---
+SEED_WINDOW = 50.0           # عرض پنجرهٔ اولیه (واحد زمان)
+SEED_METHOD = "auto"         # 'ransac' | 'kalman' | 'auto'
+SEED_MIN_SAMPLES = 5         # حداقل نقاط برای هر مدل
+SEED_RANSAC_RESID = 1.0      # آستانهٔ خطای رانساک
 
 # ---------------- Utils ----------------
 def log(msg): print(msg, flush=True)
@@ -103,6 +118,76 @@ def smooth_short_runs(labels: np.ndarray, min_len: int=SMOOTH_MIN_RUN) -> np.nda
             if cand is not None: lab[i:j+1]=cand
         i=j+1
     return lab
+
+# ---------------- Initial Label Seeding ----------------
+def seed_labels_ransac(T: np.ndarray, A: np.ndarray, num_classes: int,
+                       window: float=SEED_WINDOW,
+                       min_samples: int=SEED_MIN_SAMPLES,
+                       resid: float=SEED_RANSAC_RESID) -> np.ndarray:
+    mask = T <= (T[0] + window)
+    Tw, Aw = T[mask], A[mask]
+    out = np.full(len(T), -1, dtype=int)
+    remain = np.arange(len(Tw))
+    for lab in range(num_classes):
+        if len(remain) < min_samples:
+            break
+        ransac = RANSACRegressor(base_estimator=LinearRegression(),
+                                 min_samples=min_samples,
+                                 residual_threshold=resid)
+        ransac.fit(Tw[remain].reshape(-1,1), Aw[remain])
+        inliers = remain[ransac.inlier_mask_]
+        if len(inliers) < min_samples:
+            break
+        out[np.where(mask)[0][inliers]] = lab
+        remain = remain[~ransac.inlier_mask_]
+    return out
+
+
+def seed_labels_kalman(T: np.ndarray, A: np.ndarray, num_classes: int,
+                       window: float=SEED_WINDOW) -> np.ndarray:
+    mask = T <= (T[0] + window)
+    out = np.full(len(T), -1, dtype=int)
+    if not HAS_FILTERPY or mask.sum() < 2:
+        return out
+    k = min(num_classes, mask.sum())
+    if k <= 0:
+        return out
+    km = KMeans(n_clusters=k, n_init=10).fit(A[mask].reshape(-1,1))
+    labels = km.labels_
+    out[np.where(mask)[0]] = labels
+    # simple Kalman smoothing per cluster
+    for lab in range(k):
+        idx = np.where(out == lab)[0]
+        if len(idx) < 2:
+            continue
+        kf = KalmanFilter(dim_x=2, dim_z=1)
+        kf.H = np.array([[1.,0.]])
+        kf.P *= 10
+        kf.R *= 5
+        kf.Q = np.eye(2) * 0.01
+        kf.x = np.array([A[idx[0]], 0.0])
+        prev_t = T[idx[0]]
+        for j in idx[1:]:
+            dt = T[j] - prev_t
+            kf.F = np.array([[1., dt],[0.,1.]])
+            kf.predict()
+            kf.update(A[j])
+            prev_t = T[j]
+    return out
+
+
+def seed_initial_labels(T: np.ndarray, A: np.ndarray, num_classes: int,
+                        method: str=SEED_METHOD) -> np.ndarray:
+    if method == "ransac":
+        return seed_labels_ransac(T, A, num_classes)
+    if method == "kalman":
+        return seed_labels_kalman(T, A, num_classes)
+    # auto: pick method with more labeled points
+    r = seed_labels_ransac(T, A, num_classes)
+    k = seed_labels_kalman(T, A, num_classes)
+    if (k >= 0).sum() > (r >= 0).sum():
+        return k
+    return r
 
 # ---------------- Feature Engineering ----------------
 def engineer_features(df: pd.DataFrame):
@@ -332,6 +417,13 @@ def process_one(csv_path: str):
     y_pp = enforce_uniqueness_prob_aware(T, A, y_row, logits_row, alpha=PP_ALPHA, beta=PP_BETA, conf_thr=PP_CONF_THRESH)
     # 2) smoothing
     y_pp = smooth_short_runs(y_pp, min_len=SMOOTH_MIN_RUN)
+
+    # 3) seed initial labels using classical methods
+    seeds = seed_initial_labels(T, A, C, method=SEED_METHOD)
+    m = seeds >= 0
+    if m.any():
+        y_row[m] = seeds[m]
+        y_pp[m] = seeds[m]
 
     base  = Path(csv_path).stem
     out_csv = Path(OUT_DIR, "real", f"{base}_{model_tag}_inference.csv")
